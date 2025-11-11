@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>60-Minute Minute-Beep Timer</title>
+<style>
+  :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+  body{display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0f172a;color:#e6eef8}
+  .card{width:min(720px,95%);background:linear-gradient(180deg,#0b1220 0%, #071025 100%);border-radius:12px;padding:20px;box-shadow:0 8px 30px rgba(2,6,23,0.6)}
+  h1{margin:0 0 8px;font-size:1.3rem}
+  p{margin:0 0 16px;color:#9fb0cf}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  button{background:#1f6feb;border:none;padding:10px 14px;border-radius:8px;color:white;font-weight:600;cursor:pointer}
+  button.secondary{background:#2d3340}
+  button.danger{background:#b33a3a}
+  .status{display:flex;gap:12px;align-items:center;margin:12px 0}
+  .big{font-size:2.1rem;font-weight:700}
+  .small{color:#9fb0cf;font-size:.9rem}
+  .progress{height:10px;background:#111827;border-radius:999px;overflow:hidden;margin-top:8px}
+  .bar{height:100%;background:linear-gradient(90deg,#22c1c3,#1f6feb);width:0%}
+  .note{font-size:.85rem;color:#9fb0cf;margin-top:12px}
+  input[type=number]{width:110px;padding:8px;border-radius:8px;border:none;background:#0b1220;color:#e6eef8}
+  label{font-size:.9rem;color:#9fb0cf}
+</style>
+</head>
+<body>
+  <div class="card" role="application" aria-label="60 minute beep timer">
+    <h1>Minute Beeper — 60-minute run</h1>
+    <p>Plays a short beep immediately and then once every minute for a total of 60 beeps. Requires a user click to enable sound (browser autoplay rules).</p>
+
+    <div class="controls" id="controls">
+      <button id="startBtn">Start</button>
+      <button id="pauseBtn" class="secondary" disabled>Pause</button>
+      <button id="resumeBtn" class="secondary" disabled>Resume</button>
+      <button id="stopBtn" class="danger" disabled>Stop / Reset</button>
+
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <label for="lengthMin" class="small">Total minutes</label>
+        <input id="lengthMin" type="number" min="1" max="180" value="60" />
+      </div>
+    </div>
+
+    <div class="status">
+      <div>
+        <div class="small">Beep count</div>
+        <div id="count" class="big">0 / 60</div>
+      </div>
+
+      <div style="margin-left:16px">
+        <div class="small">Time until next beep</div>
+        <div id="next" class="big">—</div>
+      </div>
+
+      <div style="margin-left:auto;text-align:right">
+        <div class="small">State</div>
+        <div id="state" class="big">idle</div>
+      </div>
+    </div>
+
+    <div class="progress" aria-hidden="true">
+      <div id="progressBar" class="bar" style="width:0%"></div>
+    </div>
+
+    <div class="note">
+      Tip: Start in a quiet place. If the page is backgrounded some browsers throttle timers; this app uses performance-backed scheduling to reduce drift but keep the page visible for maximum reliability.
+    </div>
+  </div>
+
+<script>
+(() => {
+  // Elements
+  const startBtn = document.getElementById('startBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const resumeBtn = document.getElementById('resumeBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const countEl = document.getElementById('count');
+  const nextEl = document.getElementById('next');
+  const stateEl = document.getElementById('state');
+  const progressBar = document.getElementById('progressBar');
+  const lengthInput = document.getElementById('lengthMin');
+
+  // Audio
+  let audioCtx = null;
+
+  function ensureAudioContext() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+  }
+
+  function playBeep(durationSeconds = 0.45, frequency = 880, type = 'sine') {
+    // Must be called after user gesture that created/resumed audioCtx
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.value = frequency;
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(0.8, now + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, now + durationSeconds);
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start(now);
+    o.stop(now + durationSeconds + 0.02);
+  }
+
+  // Scheduler with drift correction using performance.now()
+  let totalBeeps = 60;
+  let beepCount = 0;
+  let startPerf = 0;
+  let tickTimer = null;
+  let running = false;
+  let paused = false;
+  let pausePerf = 0;
+  let nextTargetPerf = 0;
+
+  function secToHHMMSS(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    const mm = Math.floor(sec / 60);
+    const ss = sec % 60;
+    return mm + 'm ' + String(ss).padStart(2, '0') + 's';
+  }
+
+  function updateUI() {
+    countEl.textContent = `${beepCount} / ${totalBeeps}`;
+    stateEl.textContent = running ? (paused ? 'paused' : 'running') : 'idle';
+    const progress = totalBeeps ? (beepCount / totalBeeps) * 100 : 0;
+    progressBar.style.width = progress + '%';
+
+    if (!running || paused) {
+      nextEl.textContent = '—';
+      return;
+    }
+
+    const remainingMs = Math.max(0, nextTargetPerf - performance.now());
+    nextEl.textContent = secToHHMMSS(Math.ceil(remainingMs / 1000));
+  }
+
+  function scheduleNextTick() {
+    // schedule the next tick based on startPerf and beepCount (drift-corrected).
+    if (!running || paused) return;
+
+    // Next target is startPerf + (beepCount)*60000
+    // beepCount already includes the beeps that have happened.
+    nextTargetPerf = startPerf + (beepCount) * 60000;
+    const delay = nextTargetPerf - performance.now();
+
+    // Safety: if delay <= 0, fire immediately (catch-up)
+    const clampedDelay = Math.max(0, delay);
+
+    // Clear existing timer then set new.
+    if (tickTimer) {
+      clearTimeout(tickTimer);
+      tickTimer = null;
+    }
+
+    tickTimer = setTimeout(() => {
+      tickTimer = null;
+      if (!running || paused) return;
+      // Do beep
+      // Ensure context resumed
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(()=>{});
+      }
+      playBeep();
+      beepCount++;
+      updateUI();
+
+      if (beepCount >= totalBeeps) {
+        finishRun();
+      } else {
+        // schedule next
+        scheduleNextTick();
+      }
+    }, clampedDelay);
+    updateUI();
+  }
+
+  function startRun() {
+    // Called on user gesture
+    ensureAudioContext();
+    if (audioCtx.state === 'suspended') {
+      // resume audio context so browser allows sound
+      audioCtx.resume().catch(()=>{});
+    }
+    // Setup
+    totalBeeps = Math.max(1, Math.min(180, parseInt(lengthInput.value) || 60));
+    beepCount = 0;
+    running = true;
+    paused = false;
+    startPerf = performance.now();
+    // Immediately play first beep (counts as beep 1)
+    playBeep();
+    beepCount = 1;
+    updateUI();
+
+    // schedule the rest
+    scheduleNextTick();
+
+    // Enable/disable buttons
+    startBtn.disabled = true;
+    pauseBtn.disabled = false;
+    resumeBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+
+  function finishRun() {
+    running = false;
+    paused = false;
+    if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; }
+    updateUI();
+    startBtn.disabled = false;
+    pauseBtn.disabled = true;
+    resumeBtn.disabled = true;
+    stopBtn.disabled = true;
+    // final chime sequence to indicate finish (three quick beeps)
+    if (audioCtx) {
+      setTimeout(()=>playBeep(0.12, 880), 200);
+      setTimeout(()=>playBeep(0.12, 880), 420);
+      setTimeout(()=>playBeep(0.12, 880), 640);
+    }
+  }
+
+  function stopRun() {
+    running = false;
+    paused = false;
+    if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; }
+    beepCount = 0;
+    updateUI();
+    startBtn.disabled = false;
+    pauseBtn.disabled = true;
+    resumeBtn.disabled = true;
+    stopBtn.disabled = true;
+  }
+
+  function pauseRun() {
+    if (!running || paused) return;
+    paused = true;
+    pausePerf = performance.now();
+    if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; }
+    // We'll keep startPerf so we can resume with precise offset
+    updateUI();
+    startBtn.disabled = true;
+    pauseBtn.disabled = true;
+    resumeBtn.disabled = false;
+    stopBtn.disabled = false;
+  }
+
+  function resumeRun() {
+    if (!running || !paused) return;
+    // Adjust startPerf forward by the paused duration so schedule stays correct
+    const pausedDuration = performance.now() - pausePerf;
+    startPerf += pausedDuration;
+    paused = false;
+    scheduleNextTick();
+    updateUI();
+    startBtn.disabled = true;
+    pauseBtn.disabled = false;
+    resumeBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+
+  // Attach events
+  startBtn.addEventListener('click', () => {
+    // This click is the required user gesture for audio.
+    ensureAudioContext();
+    // If audio context is suspended (autoplay rules), resume it now.
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(()=>{});
+    }
+    startRun();
+  });
+
+  pauseBtn.addEventListener('click', pauseRun);
+  resumeBtn.addEventListener('click', resumeRun);
+  stopBtn.addEventListener('click', () => {
+    stopRun();
+    // Optionally close audio context to free resources (keeps ability to restart)
+    if (audioCtx && audioCtx.state !== 'closed') {
+      try { audioCtx.close(); } catch(e) {}
+      audioCtx = null;
+    }
+  });
+
+  // Update displayed info every 250ms for countdown
+  setInterval(() => {
+    if (running && !paused) {
+      updateUI();
+    }
+  }, 250);
+
+  // Keyboard shortcuts for convenience
+  document.addEventListener('keydown', (e) => {
+    if (e.key === ' ' && !e.repeat) { // space toggles start/pause/resume
+      e.preventDefault();
+      if (!running) startBtn.click();
+      else if (!paused) pauseBtn.click();
+      else resumeBtn.click();
+    }
+    if (e.key.toLowerCase() === 's' && !e.repeat) stopBtn.click();
+  });
+
+  // Initialize UI
+  stopRun();
+})();
+</script>
+</body>
+</html>
+
